@@ -1,27 +1,26 @@
 import whoisdomain as whois
 from tqdm import tqdm
-import retry
+from retry import retry
 import asyncio
 import os
 import sys
 
-from whoisdomain.exceptions import WhoisException
+from whoisdomain.exceptions import WhoisCommandTimeout, WhoisException
 
 sys.path.append(os.path.expanduser('~/.local/lib/python3.10/site-packages/'))
 tld_file = os.path.abspath('./tlds-alpha-by-domain.txt')
 avail_file = os.path.abspath('./available.txt')
 
-def retry_on_timeout(exception):
-    """ Return True if exception is Timeout """
-    return isinstance(exception, whois.WhoisCommandTimeout)
 
-
-async def get_tld(tld_file):
-    with open(tld_file, 'r', encoding='utf8') as rd_tld:
-        tld_long_list = list(rd_tld)
-        tld_set = set(x for x in tld_long_list if len(x) <= 3)
-        rd_tld.close()
-        if len(list(tld_set)) > 1:
+def get_tld(tld_file):
+    with open(tld_file, 'r', encoding='utf8', newline='\n') as rd_tld:
+        tld_long_list = rd_tld.readlines()
+        tld_set = []
+        for x in tld_long_list:
+            if len(x) <= 3:
+                nx = x.rstrip().lower()
+                tld_set.append(nx)
+        if len(tld_set) > 1:
             return tld_set
         else:
             print('TLD list is empty')
@@ -30,70 +29,85 @@ async def get_tld(tld_file):
 
 # Generate a queue of all possible 3-letter/number domain names
 async def gen_names(domains):
-    tld_list = list(await get_tld(tld_file))
-    domains_queue = set()
+    tld_list = list(get_tld(tld_file))
 
-    async def gen1():
+    def gen1():
+        dlist1 = list()
         for a in range(48, 58):
             for b in range(48, 58):
                 for c in range(48, 58):
                     for x in tld_list:
                         domain1 = chr(a) + chr(b) + chr(c) + "." + x
                         if domain1 not in domains:
-                            domains_queue.add(domain1)
+                            dlist1.append(domain1)
+        return dlist1
 
-    async def gen2():
+    def gen2():
+        dlist2 = list()
         for d in range(97, 123):
             for e in range(97, 123):
                 for f in range(97, 123):
                     for y in tld_list:
                         domain2 = chr(d) + chr(e) + chr(f) + "." + y
                         if domain2 not in domains:
-                            domains_queue.add(domain2)
+                            dlist2.append(domain2)
+        return dlist2
 
-    async def gen3():
+    def gen3():
+        dlist3 = list()
         for i in range(97, 123):
             for j in range(48, 58):
                 for k in range(97, 123):
                     for z in tld_list:
                         domain3 = chr(i) + chr(j) + chr(k) + "." + z
                         if domain3 not in domains:
-                            domains_queue.put(domain3)
+                            dlist3.append(domain3)
+        return dlist3
 
-    domains_queue = set(await gen1() | await gen2() | await gen3())
-    return domains_queue
+    coro = await asyncio.gather(asyncio.to_thread(gen1), asyncio.to_thread(gen2), asyncio.to_thread(gen3))
+    return coro
 
 
 # Function to check the availability of a domain name
-@retry(retry_on_exception=retry_on_timeout, stop_max_attempt_number=5)
-async def check_availability(prgs_bar, untested):
+@retry(WhoisCommandTimeout, tries=5, delay=3)
+def bitch(name, queue, prgs_bar):
+    dom = queue.get()
+    save = False
+    up_prgs = False
+    try:
+        reg = whois.query(dom, withPublicSuffix=True)
+        if reg:
+            up_prgs = True
+            print("Domain " + dom + " is already registered.")
+    except whois.WhoisCommandTimeout:
+        print('timeout error occurred')
+    except whois.WhoisPrivateRegistry:
+        up_prgs = True
+    except whois.WhoisQuotaExceeded:
+        print('Quota exceeded')
+        sys.exit()
+    except WhoisException:
+        save = True
+        up_prgs = True
+    if save:
+        print(f'{name} has completed.')
+        return dom
+    if up_prgs:
+        prgs_bar.update(1)
+        prgs_bar.set_description("Checking %s" % dom)
+        queue.task_done()
+
+
+async def check_doms(prgs_bar, untested):
+    queue = asyncio.Queue()
     results = []
+    bitches = []
     for dom in untested:
-        save = False
-        try:
-            reg = whois.query(dom, withPublicSuffix=True)
-            if reg:
-                prgs_bar.update(1)
-                prgs_bar.set_description("Checking %s" % dom)
-                print("Domain " + dom + " is already registered.")
-                pass
-        except whois.WhoisCommandTimeout:
-            print('timeout error occurred')
-            prgs_bar.update(1)
-            prgs_bar.set_description("Checking %s" % dom)
-        except whois.WhoisPrivateRegistry:
-            prgs_bar.update(1)
-            prgs_bar.set_description("Checking %s" % dom)
-            pass
-        except whois.WhoisQuotaExceeded:
-            print('Quota exceeded')
-            sys.exit()
-        except WhoisException:
-            prgs_bar.update(1)
-            prgs_bar.set_description("Checking %s" % dom)
-            save = True
-        if save:
-            results.append(dom)
+        queue.put_nowait(dom)
+    for i in range(0, 5):
+        task = asyncio.create_task(bitch(f'bitch-{i}', queue, prgs_bar))
+        bitches.append(task)
+    results = await asyncio.gather(*bitches, return_exceptions=True)
     return results
 
 
@@ -106,7 +120,7 @@ async def main():
         domains = set()
     untested = await gen_names(domains)
     prgs_bar = tqdm(total=1000000, desc=('Checking Domains'))
-    results = await check_availability(prgs_bar, untested)
+    results = await check_doms(prgs_bar, untested)
     # Open a file to save available domains
     file_wrote = False
     with open(avail_file, "w", encoding='utf8', newline='\n') as faav:
@@ -119,4 +133,4 @@ async def main():
 
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
