@@ -14,6 +14,8 @@ tqdm = "^4.66.1"
 tld = "^0.13"
 fqdn-parser = "^2.1.6"
 retry = "^0.9.2"
+alive-progress = "^3.1.4"
+decorator = "^5.1.1"
 
 
 [build-system]

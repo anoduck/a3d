@@ -1,5 +1,6 @@
+from asyncio.tasks import as_completed
 import whoisdomain as whois
-from tqdm import tqdm
+import alive_progress
 from retry import retry
 import asyncio
 import os
@@ -69,45 +70,41 @@ async def gen_names(domains):
 
 
 # Function to check the availability of a domain name
-@retry(WhoisCommandTimeout, tries=5, delay=3)
-def bitch(name, queue, prgs_bar):
-    dom = queue.get()
+@retry(exceptions=whois.WhoisCommandTimeout, tries=5, delay=3, jitter=(3, 5))
+@retry(exceptions=whois.WhoisQuotaExceeded, tries=5, delay=5, backoff=5, jitter=(1, 3))
+async def bitch(queue, bar):
+    dom = await queue.get()
     save = False
     up_prgs = False
     try:
         reg = whois.query(dom, withPublicSuffix=True)
         if reg:
             up_prgs = True
-            print("Domain " + dom + " is already registered.")
     except whois.WhoisCommandTimeout:
-        print('timeout error occurred')
+        raise Exception('Timeout Occurred')
     except whois.WhoisPrivateRegistry:
         up_prgs = True
     except whois.WhoisQuotaExceeded:
-        print('Quota exceeded')
-        sys.exit()
+        raise Exception('Quota Exceeded')
     except WhoisException:
         save = True
         up_prgs = True
     if save:
-        print(f'{name} has completed.')
         return dom
     if up_prgs:
-        prgs_bar.update(1)
-        prgs_bar.set_description("Checking %s" % dom)
         queue.task_done()
+        bar()
 
 
-async def check_doms(prgs_bar, untested):
+async def check_doms(untested):
     queue = asyncio.Queue()
-    results = []
-    bitches = []
-    for dom in untested:
+    unified = untested[0] + untested[1] + untested[2]
+    for dom in unified:
         queue.put_nowait(dom)
-    for i in range(0, 5):
-        task = asyncio.create_task(bitch(f'bitch-{i}', queue, prgs_bar))
-        bitches.append(task)
-    results = await asyncio.gather(*bitches, return_exceptions=True)
+    with alive_progress.alive_bar(len(unified)) as bar:
+        tasks = [asyncio.create_task(bitch(queue, bar),
+                                     name='Dom_Worker-{i}') for i in range(10)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
     return results
 
 
@@ -119,17 +116,11 @@ async def main():
     else:
         domains = set()
     untested = await gen_names(domains)
-    prgs_bar = tqdm(total=1000000, desc=('Checking Domains'))
-    results = await check_doms(prgs_bar, untested)
-    # Open a file to save available domains
-    file_wrote = False
-    with open(avail_file, "w", encoding='utf8', newline='\n') as faav:
-        for fdom in results:
-            faav.write(fdom)
-            faav.write('\n')
-        file_wrote = True
-    if file_wrote:
-        print("The available domains have been saved to available.txt")
+    results = await check_doms(untested)
+    for result in results:
+        with open(avail_file, 'w', encoding='utf8', newline='\n') as fafa:
+            fafa.write(result)
+            fafa.write('\n')
 
 
 if __name__ == '__main__':
