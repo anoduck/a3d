@@ -1,4 +1,4 @@
-from asyncio.tasks import as_completed
+from asyncio.tasks import as_completed, create_task
 import whoisdomain as whois
 import alive_progress
 from retry import retry
@@ -69,43 +69,75 @@ async def gen_names(domains):
     return coro
 
 
+async def write_to(result):
+    with open(avail_file, 'a', encoding='utf8', newline='\n') as wf:
+        wf.write(result)
+        wf.write('\n')
+    return True
+
+
 # Function to check the availability of a domain name
 @retry(exceptions=whois.WhoisCommandTimeout, tries=5, delay=3, jitter=(3, 5))
 @retry(exceptions=whois.WhoisQuotaExceeded, tries=5, delay=5, backoff=5, jitter=(1, 3))
 async def bitch(queue, bar):
-    dom = await queue.get()
-    save = False
-    up_prgs = False
-    try:
-        reg = whois.query(dom, withPublicSuffix=True)
-        if reg:
+    # Lock process in a loop until it is canceled.
+    while True:
+        dom = await queue.get()
+        save = False
+        up_prgs = False
+        try:
+            reg = whois.query(dom, withPublicSuffix=True)
+            if reg:
+                up_prgs = True
+        except whois.WhoisCommandTimeout:
             up_prgs = True
-    except whois.WhoisCommandTimeout:
-        raise Exception('Timeout Occurred')
-    except whois.WhoisPrivateRegistry:
-        up_prgs = True
-    except whois.WhoisQuotaExceeded:
-        raise Exception('Quota Exceeded')
-    except WhoisException:
-        save = True
-        up_prgs = True
-    if save:
-        return dom
-    if up_prgs:
-        queue.task_done()
-        bar()
+            raise Exception('Timeout Occurred')
+        except whois.WhoisPrivateRegistry:
+            up_prgs = True
+        except whois.WhoisQuotaExceeded:
+            up_prgs = True
+            raise Exception('Quota Exceeded')
+        except WhoisException:
+            save = True
+        if save:
+            writ = await write_to(dom)
+            if writ:
+                bar()
+                queue.task_done()
+        if up_prgs:
+            bar()
+            queue.task_done()
+
+
+async def task_cancel(other_task):
+    await asyncio.sleep(0.3)
+    other_task.cancel()
 
 
 async def check_doms(untested):
-    queue = asyncio.Queue()
     unified = untested[0] + untested[1] + untested[2]
-    for dom in unified:
-        queue.put_nowait(dom)
+    queue = asyncio.Queue()
     with alive_progress.alive_bar(len(unified)) as bar:
-        tasks = [asyncio.create_task(bitch(queue, bar),
-                                     name='Dom_Worker-{i}') for i in range(10)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-    return results
+        for i in unified:
+            queue.put_nowait(i)
+        tasks = []
+        for i in range(10):
+            name = str(f'bitch-{i}')
+            task = asyncio.create_task(bitch(queue, bar), name=name)
+            twait = await asyncio.wait_for(task, timeout=3)
+            tcan = asyncio.create_task(task_cancel(twait))
+            wtask = asyncio.create_task(tcan)
+            tasks.append(wtask)
+        qcomp = asyncio.create_task(queue.join())
+        await asyncio.wait([qcomp, *tasks])
+        if not qcomp.done():
+            for t in tasks:
+                if t.done():
+                    t.result()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tasks:
+            task.cancel()
+        return True
 
 
 async def main():
@@ -116,11 +148,9 @@ async def main():
     else:
         domains = set()
     untested = await gen_names(domains)
-    results = await check_doms(untested)
-    for result in results:
-        with open(avail_file, 'w', encoding='utf8', newline='\n') as fafa:
-            fafa.write(result)
-            fafa.write('\n')
+    completed = await check_doms(untested)
+    if completed:
+        print('Done!')
 
 
 if __name__ == '__main__':
